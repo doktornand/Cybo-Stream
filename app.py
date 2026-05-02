@@ -176,7 +176,8 @@ class RateLimitedSession(requests.Session):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ThreatFeedManager:
-    TARGETS = ['US', 'DE', 'FR', 'GB', 'JP']
+    #TARGETS = ['US', 'DE', 'FR', 'GB', 'JP']
+    TARGETS = ['FR']
 
     def __init__(self, api_keys: dict):
         self.api_keys = api_keys
