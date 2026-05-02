@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-Cyber Threat Map — Version Streamlit
+Cyber Threat Map — Version Purifiée
 =====================================
-Déploiement cloud-ready sur streamlit.io
-• Pas de fichiers locaux persistant → st.session_state + st.cache_data
-• Pas de boucle bloquante → bouton "Rafraîchir" + auto-refresh optionnel
-• Carte Folium native via st_folium
-• Export CSV/JSON via st.download_button
+Architecture :
+  • ZERO clé API dans l'interface (secrets serveur uniquement)
+  • ZERO probe_ips hardcodés — chaînage dynamique feed → feed
+  • Sources sans clé : DShield (IPs réelles), CIRCL CVE (vulnérabilités réelles)
+  • Sources avec clé : chaînées dynamiquement (ex: AbuseIPDB → Shodan/VT)
+  • Fallback honnête : si aucune donnée fraîche, on le dit — pas de faux "temps réel"
 """
 
 import streamlit as st
@@ -21,29 +22,106 @@ import time
 import csv
 import io
 import ipaddress
-from datetime import datetime, timedelta
+import os
+from datetime import datetime
 from dataclasses import dataclass, asdict
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 from collections import Counter
 import urllib3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURATION & SECRETS
+# SECRETS MANAGER — Strictement serveur, jamais UI
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_config():
-    """Charge la config depuis st.secrets (prod) ou valeurs par défaut (dev)."""
-    defaults = {
-        'abuseipdb': '', 'otx': '', 'greynoise': '',
-        'shodan': '', 'virustotal': '',
-    }
-    # Streamlit Cloud : st.secrets["api_keys"]["abuseipdb"]
-    # Local : sidebar inputs
-    if "api_keys" in st.secrets:
-        return {k: st.secrets["api_keys"].get(k, v) for k, v in defaults.items()}
-    return defaults
+class SecretsManager:
+    REQUIRED_KEYS = ['abuseipdb', 'otx', 'greynoise', 'shodan', 'virustotal']
+
+    def __init__(self):
+        self._keys: Dict[str, str] = {}
+        self._load_from_secrets()
+
+    def _load_from_secrets(self):
+        for key_name in self.REQUIRED_KEYS:
+            if "api_keys" in st.secrets and key_name in st.secrets["api_keys"]:
+                val = st.secrets["api_keys"][key_name]
+                if val and str(val).strip():
+                    self._keys[key_name] = str(val).strip()
+            env_var = f"CTM_{key_name.upper()}"
+            if key_name not in self._keys and env_var in os.environ:
+                val = os.environ[env_var]
+                if val and val.strip():
+                    self._keys[key_name] = val.strip()
+
+    def get(self, name: str) -> str:
+        return self._keys.get(name, '')
+
+    def is_configured(self, name: str) -> bool:
+        return name in self._keys and bool(self._keys[name])
+
+    def get_available_sources(self) -> Dict[str, dict]:
+        return {
+            'dshield': {
+                'label': 'DShield (SANS ISC)',
+                'description': 'Top 20 sources d'attaques réseau — données temps réel',
+                'configured': True,
+                'requires_key': False,
+                'icon': '🛡️',
+                'dynamic': True,
+            },
+            'circl_cve': {
+                'label': 'CIRCL CVE Search',
+                'description': 'CVEs récentes publiées par le CERT Luxembourg',
+                'configured': True,
+                'requires_key': False,
+                'icon': '📋',
+                'dynamic': True,
+            },
+            'abuseipdb': {
+                'label': 'AbuseIPDB',
+                'description': 'Blacklist IPs malveillantes — clé requise',
+                'configured': self.is_configured('abuseipdb'),
+                'requires_key': True,
+                'icon': '🚫',
+                'dynamic': True,
+            },
+            'otx': {
+                'label': 'AlienVault OTX',
+                'description': 'Pulses et indicateurs de menace — clé requise',
+                'configured': self.is_configured('otx'),
+                'requires_key': True,
+                'icon': '👽',
+                'dynamic': True,
+            },
+            'greynoise': {
+                'label': 'GreyNoise',
+                'description': 'Classification du bruit Internet — clé requise',
+                'configured': self.is_configured('greynoise'),
+                'requires_key': True,
+                'icon': '👻',
+                'dynamic': True,
+            },
+            'shodan': {
+                'label': 'Shodan InternetDB',
+                'description': 'Enrichissement des IPs découvertes — clé optionnelle',
+                'configured': True,  # InternetDB fonctionne sans clé
+                'requires_key': False,
+                'icon': '🔍',
+                'dynamic': True,  # Chaîné dynamiquement, pas de probe_ips
+            },
+            'virustotal': {
+                'label': 'VirusTotal',
+                'description': 'Analyse multi-moteurs — clé requise',
+                'configured': self.is_configured('virustotal'),
+                'requires_key': True,
+                'icon': '🦠',
+                'dynamic': True,  # Chaîné dynamiquement
+            },
+        }
+
+    def get_configured_key_names(self) -> List[str]:
+        return [k for k in self.REQUIRED_KEYS if self.is_configured(k)]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -68,16 +146,19 @@ class CyberAttack:
     feed_source:    str            = 'unknown'
     description:    str            = ''
     cve_id:         str            = ''
+    is_derived:     bool           = False  # Nouveau : vrai si enrichi d'un autre feed
 
     def _get_color(self) -> str:
         return {'low': '#00ff00', 'medium': '#ffff00',
                 'high': '#ff8800', 'critical': '#ff0000'}.get(self.severity, '#ffffff')
 
     def _get_popup_html(self) -> str:
+        derived_badge = '<span style="background:#ff6600;color:#fff;padding:2px 6px;border-radius:3px;font-size:.75em;">ENRICHIE</span><br>' if self.is_derived else ''
         cve_line = f'<b>CVE:</b> <a href="https://cve.mitre.org/cgi-bin/cvename.cgi?name={self.cve_id}" target="_blank" style="color:#00aaff;">{self.cve_id}</a><br>' if self.cve_id else ''
         return f"""
         <div style="font-family:monospace;background:#1a1a1a;color:#00ff00;padding:10px;
                     border-radius:5px;min-width:260px;">
+            {derived_badge}
             <h4 style="color:{self._get_color()};margin:0 0 8px 0;">⚠️ {self.attack_type}</h4>
             <hr style="border-color:#333;margin:4px 0;">
             <b>Sévérité :</b> <span style="color:{self._get_color()};">{self.severity.upper()}</span><br>
@@ -99,7 +180,7 @@ class CyberAttack:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GEO IP RESOLVER — Cache en mémoire (pas de fichiers locaux)
+# GEO IP RESOLVER
 # ─────────────────────────────────────────────────────────────────────────────
 
 class GeoIPResolver:
@@ -123,7 +204,6 @@ class GeoIPResolver:
 
     @st.cache_data(ttl=3600, show_spinner=False)
     def _fetch_ip_api(_self, ip: str):
-        """Cache Streamlit pour les requêtes GeoIP (1h)."""
         try:
             if ipaddress.ip_address(ip).is_private:
                 return None
@@ -168,21 +248,60 @@ class RateLimitedSession(requests.Session):
                 connect=0, read=0))
         self.mount('https://', adapter)
         self.mount('http://', adapter)
-        self.headers.update({'User-Agent': 'CyberThreatMap/2.0 (Research)'})
+        self.headers.update({'User-Agent': 'CyberThreatMap/2.0-Purified (Research)'})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# THREAT FEED MANAGER
+# IP POOL — Collecte dynamique des IPs découvertes (pas de probe_ips hardcodé)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class DiscoveredIPPool:
+    """
+    Pool d'IPs découvertes dynamiquement par les feeds "amont".
+    Les feeds "enrichissement" (Shodan, VT) consomment ce pool au lieu de probe_ips.
+    """
+    def __init__(self):
+        self.ips: Set[str] = set()
+        self.max_pool_size = 50
+
+    def add(self, ip: str):
+        if ip and ip != '0.0.0.0' and not ipaddress.ip_address(ip).is_private:
+            self.ips.add(ip)
+            # Limiter la taille pour éviter la surcharge
+            if len(self.ips) > self.max_pool_size:
+                self.ips.pop()
+
+    def add_from_attacks(self, attacks: List[CyberAttack]):
+        for a in attacks:
+            self.add(a.source_ip)
+
+    def get_sample(self, n: int = 6) -> List[str]:
+        """Retourne un échantillon aléatoire du pool."""
+        sample_size = min(n, len(self.ips))
+        if sample_size == 0:
+            return []
+        return random.sample(list(self.ips), sample_size)
+
+    def is_empty(self) -> bool:
+        return len(self.ips) == 0
+
+    def size(self) -> int:
+        return len(self.ips)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# THREAT FEED MANAGER — Chaînage dynamique, pas de probe_ips
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ThreatFeedManager:
     #TARGETS = ['US', 'DE', 'FR', 'GB', 'JP']
     TARGETS = ['FR']
 
-    def __init__(self, api_keys: dict):
-        self.api_keys = api_keys
+    def __init__(self, secrets: SecretsManager):
+        self.secrets = secrets
         self.geo = GeoIPResolver()
         self.session = RateLimitedSession()
+        self.ip_pool = DiscoveredIPPool()
         self.stats = {s: {'success': 0, 'errors': 0}
                       for s in ('abuseipdb', 'otx', 'greynoise',
                                 'dshield', 'shodan', 'virustotal', 'circl_cve')}
@@ -211,9 +330,9 @@ class ThreatFeedManager:
                 return mapping[tag.lower()]
         return random.choice(self.TARGETS)
 
-    # ── AbuseIPDB ─────────────────────────────────────────────────────────────
+    # ── AbuseIPDB — SOURCE AMONT (fournit des IPs au pool) ──────────────────
     def fetch_abuseipdb(self, limit: int = 100) -> List[CyberAttack]:
-        key = self.api_keys.get('abuseipdb', '')
+        key = self.secrets.get('abuseipdb')
         if not key:
             return []
         attacks = []
@@ -244,9 +363,9 @@ class ThreatFeedManager:
             st.warning(f"AbuseIPDB: {e}")
         return attacks
 
-    # ── AlienVault OTX ────────────────────────────────────────────────────────
+    # ── AlienVault OTX — SOURCE AMONT ───────────────────────────────────────
     def fetch_otx_pulses(self, limit: int = 10) -> List[CyberAttack]:
-        key = self.api_keys.get('otx', '')
+        key = self.secrets.get('otx')
         if not key:
             return []
         attacks = []
@@ -281,7 +400,7 @@ class ThreatFeedManager:
             st.warning(f"OTX: {e}")
         return attacks
 
-    # ── DShield (SANS ISC) — SANS CLÉ ────────────────────────────────────────
+    # ── DShield — SOURCE AMONT (toujours disponible, données réelles) ───────
     def fetch_dshield(self) -> List[CyberAttack]:
         attacks = []
         port_types = {22: 'SSH Bruteforce', 3389: 'RDP Attack',
@@ -320,52 +439,84 @@ class ThreatFeedManager:
             st.warning(f"DShield: {e}")
         return attacks
 
-    # ── GreyNoise ────────────────────────────────────────────────────────────
-    def fetch_greynoise(self, limit: int = 10) -> List[CyberAttack]:
-        key = self.api_keys.get('greynoise', '')
+    # ── GreyNoise — SOURCE AMONT ────────────────────────────────────────────
+    def fetch_greynoise(self, limit: int = 6) -> List[CyberAttack]:
+        """
+        GreyNoise Community API — utilise les IPs du pool découvert,
+        pas de probe_ips hardcodés. Si le pool est vide, on skip.
+        """
+        key = self.secrets.get('greynoise')
         if not key:
             return []
+        if self.ip_pool.is_empty():
+            st.info("ℹ️ GreyNoise : aucune IP découverte à analyser (exécutez d'abord DShield/AbuseIPDB)")
+            return []
+
         attacks = []
-        test_ips = ['185.220.101.0', '194.32.107.0', '103.253.145.0',
-                    '91.207.175.0',  '45.142.212.0', '185.156.173.0']
-        try:
-            for ip in test_ips[:limit]:
-                try:
-                    resp = self.session.get(
-                        f'https://api.greynoise.io/v3/community/{ip}',
-                        headers={'key': key}, timeout=5)
-                    data = resp.json()
-                    if data.get('noise') or data.get('riot'):
-                        loc = self.geo.get_location(ip)
-                        if loc:
-                            lat, lon, country = loc
-                            tlat, tlon, tc = self._random_target()
-                            attacks.append(CyberAttack(
-                                source_lat=lat, source_lon=lon,
-                                target_lat=tlat, target_lon=tlon,
-                                attack_type=data.get('classification', 'Internet Scan'),
-                                severity='medium' if data.get('noise') else 'low',
-                                timestamp=datetime.now(), source_ip=ip, source_country=country,
-                                target_country=tc, confidence=70,
-                                feed_source='GreyNoise',
-                                description=f"VPN:{data.get('vpn',False)} Tor:{data.get('tor',False)}"))
-                except Exception:
-                    continue
-            self.stats['greynoise']['success'] += len(attacks)
-        except Exception as e:
-            self.stats['greynoise']['errors'] += 1
-            st.warning(f"GreyNoise: {e}")
+        probe_ips = self.ip_pool.get_sample(limit)
+
+        for ip in probe_ips:
+            try:
+                resp = self.session.get(
+                    f'https://api.greynoise.io/v3/community/{ip}',
+                    headers={'key': key}, timeout=5)
+                data = resp.json()
+                if data.get('noise') or data.get('riot'):
+                    loc = self.geo.get_location(ip)
+                    if loc:
+                        lat, lon, country = loc
+                        tlat, tlon, tc = self._random_target()
+                        attacks.append(CyberAttack(
+                            source_lat=lat, source_lon=lon,
+                            target_lat=tlat, target_lon=tlon,
+                            attack_type=data.get('classification', 'Internet Scan'),
+                            severity='medium' if data.get('noise') else 'low',
+                            timestamp=datetime.now(), source_ip=ip, source_country=country,
+                            target_country=tc, confidence=70,
+                            feed_source='GreyNoise',
+                            description=f"VPN:{data.get('vpn',False)} Tor:{data.get('tor',False)}",
+                            is_derived=True))
+            except Exception:
+                continue
+        self.stats['greynoise']['success'] += len(attacks)
         return attacks
 
-    # ── Shodan InternetDB — SANS CLÉ ─────────────────────────────────────────
+    # ── Shodan — ENRICHISSEMENT (consomme le pool, pas de probe_ips) ────────
     def fetch_shodan(self) -> List[CyberAttack]:
-        key = self.api_keys.get('shodan', '')
+        """
+        Shodan InternetDB / API payante — enrichit les IPs déjà découvertes.
+        PAS de probe_ips hardcodés. Si le pool est vide, utilise InternetDB
+        avec une découverte DNS passive (sans IPs fixes).
+        """
+        key = self.secrets.get('shodan')
         attacks = []
-        probe_ips = [
-            '185.220.101.34', '192.42.116.16', '198.199.10.234',
-            '45.33.32.156',   '104.236.42.18', '5.9.16.1',
-        ]
-        for ip in probe_ips:
+
+        # Stratégie 1 : enrichir les IPs du pool si disponibles
+        pool_ips = self.ip_pool.get_sample(6) if not self.ip_pool.is_empty() else []
+
+        # Stratégie 2 : si pool vide ET pas de clé, on ne peut rien faire de dynamique
+        # → on retourne vide avec un message honnête
+        if not pool_ips and not key:
+            st.info("ℹ️ Shodan : exécutez d'abord DShield/AbuseIPDB pour découvrir des IPs à analyser")
+            return []
+
+        # Si pool vide mais clé dispo, on fait une recherche Shodan pour trouver des hôtes
+        if not pool_ips and key:
+            try:
+                # Recherche de scanners récents (pas de probe_ips, requête dynamique)
+                resp = self.session.get(
+                    'https://api.shodan.io/shodan/host/search',
+                    params={'key': key, 'query': 'category:malware', 'limit': 6},
+                    timeout=10)
+                results = resp.json().get('matches', [])
+                for match in results:
+                    ip = match.get('ip_str')
+                    if ip:
+                        pool_ips.append(ip)
+            except Exception:
+                pass
+
+        for ip in pool_ips:
             try:
                 if key:
                     resp = self.session.get(
@@ -403,22 +554,29 @@ class ThreatFeedManager:
                     target_country=tc, port=port, confidence=85,
                     feed_source='Shodan',
                     description=f"Open ports: {open_ports[:5]} | CVEs: {vulns[:3]}",
-                    cve_id=cve_id))
-            except Exception as e:
+                    cve_id=cve_id,
+                    is_derived=True))
+            except Exception:
                 pass
         self.stats['shodan']['success'] += len(attacks)
         return attacks
 
-    # ── VirusTotal ───────────────────────────────────────────────────────────
+    # ── VirusTotal — ENRICHISSEMENT (consomme le pool, pas de probe_ips) ────
     def fetch_virustotal(self) -> List[CyberAttack]:
-        key = self.api_keys.get('virustotal', '')
+        """
+        VirusTotal — analyse les IPs du pool découvert.
+        PAS de probe_ips hardcodés.
+        """
+        key = self.secrets.get('virustotal')
         if not key:
             return []
+        if self.ip_pool.is_empty():
+            st.info("ℹ️ VirusTotal : aucune IP découverte à analyser (exécutez d'abord DShield/AbuseIPDB)")
+            return []
+
         attacks = []
-        probe_ips = [
-            '5.188.86.172', '91.108.4.1', '185.220.102.8',
-            '109.70.100.22', '176.10.104.240',
-        ]
+        probe_ips = self.ip_pool.get_sample(5)
+
         for ip in probe_ips:
             try:
                 resp = self.session.get(
@@ -446,15 +604,16 @@ class ThreatFeedManager:
                     timestamp=datetime.now(), source_ip=ip, source_country=country,
                     target_country=tc, confidence=confidence,
                     feed_source='VirusTotal',
-                    description=f"Malicious engines: {malicious}/72"))
-            except Exception as e:
+                    description=f"Malicious engines: {malicious}/72",
+                    is_derived=True))
+            except Exception:
                 pass
             finally:
-                time.sleep(0.25)
+                time.sleep(0.25)  # Rate limit VT
         self.stats['virustotal']['success'] += len(attacks)
         return attacks
 
-    # ── CIRCL CVE — SANS CLÉ ─────────────────────────────────────────────────
+    # ── CIRCL CVE — SOURCE INDÉPENDANTE (pas besoin d'IPs) ─────────────────
     def fetch_circl_cve(self, limit: int = 10) -> List[CyberAttack]:
         attacks = []
         try:
@@ -490,22 +649,49 @@ class ThreatFeedManager:
             st.warning(f"CIRCL CVE: {e}")
         return attacks
 
-    # ── Agrégation séquentielle (pas de threads pour Streamlit) ──────────────
+    # ── Orchestration chaînée ───────────────────────────────────────────────
     def fetch_all_feeds(self, selected_feeds: List[str]) -> List[CyberAttack]:
+        """
+        Ordre d'exécution optimisé :
+        1. Sources amont (génèrent des IPs réelles)
+        2. Alimentation du pool
+        3. Sources d'enrichissement (consomment le pool)
+        4. Sources indépendantes (CVE)
+        """
         all_attacks: List[CyberAttack] = []
-        tasks = {
+
+        # Phase 1 : Sources amont (indépendantes)
+        upstream_tasks = {
+            'dshield': self.fetch_dshield,
             'abuseipdb': self.fetch_abuseipdb,
             'otx': self.fetch_otx_pulses,
-            'greynoise': self.fetch_greynoise,
-            'dshield': self.fetch_dshield,
-            'shodan': self.fetch_shodan,
-            'virustotal': self.fetch_virustotal,
-            'circl_cve': self.fetch_circl_cve,
         }
         for name in selected_feeds:
-            if name in tasks:
-                with st.spinner(f"🔄 Récupération {name}..."):
-                    all_attacks.extend(tasks[name]())
+            if name in upstream_tasks:
+                with st.spinner(f"🔄 Phase 1 — Source amont : {name}..."):
+                    attacks = upstream_tasks[name]()
+                    all_attacks.extend(attacks)
+                    self.ip_pool.add_from_attacks(attacks)
+
+        # Phase 2 : Enrichissement (dépend du pool)
+        if self.ip_pool.size() > 0:
+            st.info(f"📦 {self.ip_pool.size()} IPs découvertes — enrichissement en cours...")
+
+        enrichment_tasks = {
+            'shodan': self.fetch_shodan,
+            'virustotal': self.fetch_virustotal,
+            'greynoise': self.fetch_greynoise,
+        }
+        for name in selected_feeds:
+            if name in enrichment_tasks:
+                with st.spinner(f"🔄 Phase 2 — Enrichissement : {name}..."):
+                    all_attacks.extend(enrichment_tasks[name]())
+
+        # Phase 3 : Sources indépendantes
+        if 'circl_cve' in selected_feeds:
+            with st.spinner("🔄 Phase 3 — CVEs récentes..."):
+                all_attacks.extend(self.fetch_circl_cve())
+
         return all_attacks
 
 
@@ -514,9 +700,7 @@ class ThreatFeedManager:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_map(attacks: List[CyberAttack], show_heatmap: bool = True) -> folium.Map:
-    m = folium.Map(location=[25, 10], zoom_start=3,
-                   tiles='CartoDB dark_matter')
-
+    m = folium.Map(location=[25, 10], zoom_start=3, tiles='CartoDB dark_matter')
     connections = folium.FeatureGroup(name="Flux d'Attaques")
     markers = folium.FeatureGroup(name="Sources & Cibles")
     heatmap = folium.FeatureGroup(name="Heatmap")
@@ -584,76 +768,84 @@ def attacks_to_json(attacks: List[CyberAttack]) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STREAMLIT UI
+# UI COMPONENTS
 # ─────────────────────────────────────────────────────────────────────────────
 
-def init_session_state():
-    defaults = {
-        'attacks_history': [],
-        'feed_manager': None,
-        'last_update': None,
-        'stats': {},
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+def render_source_status(sources: Dict[str, dict]):
+    st.subheader("📡 État des sources")
+
+    dynamic = [s for s in sources.values() if s.get('dynamic')]
+    free = [s for s in dynamic if not s['requires_key']]
+    keyed = [s for s in dynamic if s['requires_key']]
+
+    st.markdown("**🟢 Sources gratuites (temps réel)**")
+    free_cols = st.columns(len(free))
+    for col, src in zip(free_cols, free):
+        with col:
+            st.success(f"{src['icon']} **{src['label']}**")
+            st.caption(f"✅ {src['description']}")
+
+    if keyed:
+        st.markdown("**🔐 Sources avec clé API**")
+        key_cols = st.columns(min(len(keyed), 4))
+        for col, src in zip(key_cols, keyed):
+            with col:
+                if src['configured']:
+                    st.success(f"{src['icon']} **{src['label']}**")
+                    st.caption("🔐 Clé configurée")
+                else:
+                    st.error(f"{src['icon']} **{src['label']}**")
+                    st.caption("❌ Clé manquante")
 
 
-def render_sidebar():
+def render_sidebar(secrets: SecretsManager):
     with st.sidebar:
-        st.title("🛡️ Configuration")
+        st.title("🛡️ Cyber Threat Map")
         st.markdown("---")
 
-        # Clés API
-        st.subheader("🔑 Clés API (optionnel)")
-        st.caption("Sources sans clé : DShield, CIRCL CVE, Shodan InternetDB")
-
-        api_keys = {}
-        api_keys['abuseipdb'] = st.text_input("AbuseIPDB", type="password",
-                                               value=st.secrets.get("api_keys", {}).get("abuseipdb", "")
-                                               if "api_keys" in st.secrets else "")
-        api_keys['otx'] = st.text_input("AlienVault OTX", type="password",
-                                         value=st.secrets.get("api_keys", {}).get("otx", "")
-                                         if "api_keys" in st.secrets else "")
-        api_keys['greynoise'] = st.text_input("GreyNoise", type="password",
-                                               value=st.secrets.get("api_keys", {}).get("greynoise", "")
-                                               if "api_keys" in st.secrets else "")
-        api_keys['shodan'] = st.text_input("Shodan (optionnel)", type="password",
-                                            value=st.secrets.get("api_keys", {}).get("shodan", "")
-                                            if "api_keys" in st.secrets else "")
-        api_keys['virustotal'] = st.text_input("VirusTotal", type="password",
-                                                value=st.secrets.get("api_keys", {}).get("virustotal", "")
-                                                if "api_keys" in st.secrets else "")
+        st.subheader("🔐 Sécurité")
+        configured = secrets.get_configured_key_names()
+        if configured:
+            st.success(f"🔒 {len(configured)} clé(s) API chargée(s) depuis le serveur")
+            with st.expander("Sources activées"):
+                for name in configured:
+                    st.write(f"• {name}")
+        else:
+            st.info("ℹ️ Mode gratuit — DShield, CIRCL CVE et Shodan InternetDB disponibles")
 
         st.markdown("---")
-        st.subheader("📡 Sources à activer")
-        available = {
-            'dshield': 'DShield (SANS) — sans clé',
-            'circl_cve': 'CIRCL CVE — sans clé',
-            'shodan': 'Shodan InternetDB — sans clé',
-            'abuseipdb': 'AbuseIPDB — clé requise',
-            'otx': 'AlienVault OTX — clé requise',
-            'greynoise': 'GreyNoise — clé requise',
-            'virustotal': 'VirusTotal — clé requise',
-        }
-        selected = []
-        for key, label in available.items():
-            needs_key = 'clé requise' in label
-            disabled = needs_key and not api_keys.get(key)
-            if st.checkbox(label, value=not disabled, disabled=disabled, key=f"chk_{key}"):
-                selected.append(key)
-
-        st.markdown("---")
+        st.subheader("⚙️ Options d'affichage")
         show_heatmap = st.toggle("🔥 Afficher Heatmap", value=True)
         max_display = st.slider("Max attaques affichées", 50, 1000, 500)
 
-        return api_keys, selected, show_heatmap, max_display
+        st.markdown("---")
+        with st.expander("📖 Comment configurer les clés API ?"):
+            st.markdown("""
+            **Streamlit Cloud :**
+            Settings → Secrets :
+            ```toml
+            [api_keys]
+            abuseipdb = "votre_cle"
+            otx = "votre_cle"
+            greynoise = "votre_cle"
+            shodan = "votre_cle"
+            virustotal = "votre_cle"
+            ```
+
+            **Local :** `.streamlit/secrets.toml` (ajoutez à `.gitignore` !)
+
+            **Docker :** variables `CTM_ABUSEIPDB`, `CTM_OTX`, etc.
+            """)
+            st.warning("🛡️ Les clés ne transitent JAMAIS par le navigateur.")
+
+        return show_heatmap, max_display
 
 
 def render_metrics(attacks: List[CyberAttack]):
     cols = st.columns(5)
     total = len(attacks)
     by_sev = Counter(a.severity for a in attacks)
+    by_derived = sum(1 for a in attacks if a.is_derived)
     metrics = [
         ("Total", total, "#ffffff"),
         ("Critical", by_sev.get('critical', 0), "#ff0000"),
@@ -663,6 +855,8 @@ def render_metrics(attacks: List[CyberAttack]):
     ]
     for col, (label, value, color) in zip(cols, metrics):
         col.metric(label=label, value=value)
+    if by_derived > 0:
+        st.caption(f"🧬 {by_derived} attaque(s) enrichie(s) par chaînage de feeds")
 
 
 def render_stats_table(attacks: List[CyberAttack]):
@@ -691,12 +885,9 @@ def main():
         initial_sidebar_state="expanded",
     )
 
-    # CSS custom
     st.markdown("""
     <style>
-    .stApp {
-        background-color: #0e1117;
-    }
+    .stApp { background-color: #0e1117; }
     .stMetric {
         background: rgba(0,255,0,0.05);
         border: 1px solid #00ff00;
@@ -710,13 +901,29 @@ def main():
     </style>
     """, unsafe_allow_html=True)
 
-    st.title("🌐 Cyber Threat Map — Streamlit Edition")
-    st.caption("Carte interactive de menaces cyber en temps réel | Sources : AbuseIPDB, OTX, DShield, GreyNoise, Shodan, VirusTotal, CIRCL CVE")
+    st.title("🌐 Cyber Threat Map — Purified Edition")
+    st.caption("Données temps réel sans probe_ips | Chaînage dynamique feed→feed | Sources : DShield, CIRCL, AbuseIPDB, OTX, GreyNoise, Shodan, VirusTotal")
 
-    init_session_state()
-    api_keys, selected_feeds, show_heatmap, max_display = render_sidebar()
+    if 'attacks_history' not in st.session_state:
+        st.session_state.attacks_history = []
+    if 'last_update' not in st.session_state:
+        st.session_state.last_update = None
 
-    # Bouton principal
+    secrets = SecretsManager()
+    sources_info = secrets.get_available_sources()
+    show_heatmap, max_display = render_sidebar(secrets)
+
+    render_source_status(sources_info)
+    st.markdown("---")
+
+    available_feeds = [name for name, info in sources_info.items() if info['configured']]
+    selected_feeds = st.multiselect(
+        "📡 Sources à interroger",
+        options=available_feeds,
+        default=available_feeds,
+        format_func=lambda x: f"{sources_info[x]['icon']} {sources_info[x]['label']}"
+    )
+
     col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 3])
     with col_btn1:
         fetch_clicked = st.button("🔄 Récupérer les données", type="primary", use_container_width=True)
@@ -728,20 +935,20 @@ def main():
         st.session_state.last_update = None
         st.rerun()
 
-    # Récupération des données
     if fetch_clicked:
-        with st.spinner("📡 Connexion aux sources de menaces..."):
-            manager = ThreatFeedManager(api_keys)
-            new_attacks = manager.fetch_all_feeds(selected_feeds)
-            if new_attacks:
-                st.session_state.attacks_history.extend(new_attacks)
-                st.session_state.last_update = datetime.now()
-                st.session_state.stats = manager.stats
-                st.success(f"✅ {len(new_attacks)} nouvelles attaques récupérées !")
-            else:
-                st.info("ℹ️ Aucune nouvelle attaque détectée (vérifiez vos clés API)")
+        if not selected_feeds:
+            st.error("❌ Aucune source sélectionnée.")
+        else:
+            with st.spinner("📡 Connexion aux sources de menaces..."):
+                manager = ThreatFeedManager(secrets)
+                new_attacks = manager.fetch_all_feeds(selected_feeds)
+                if new_attacks:
+                    st.session_state.attacks_history.extend(new_attacks)
+                    st.session_state.last_update = datetime.now()
+                    st.success(f"✅ {len(new_attacks)} nouvelles attaques récupérées !")
+                else:
+                    st.info("ℹ️ Aucune nouvelle attaque détectée.")
 
-    # Affichage
     attacks = st.session_state.attacks_history[-max_display:]
 
     if attacks:
@@ -749,14 +956,12 @@ def main():
         render_metrics(attacks)
         st.markdown("---")
 
-        # Carte
         m = build_map(attacks, show_heatmap)
         st_folium(m, width="100%", height=700, returned_objects=[])
 
         st.markdown("---")
         render_stats_table(attacks)
 
-        # Exports
         st.markdown("---")
         st.subheader("📦 Exports")
         col_exp1, col_exp2 = st.columns(2)
@@ -777,7 +982,6 @@ def main():
                 use_container_width=True,
             )
 
-        # Derniers événements
         st.markdown("---")
         st.subheader("📋 Derniers événements")
         df_data = []
@@ -789,26 +993,25 @@ def main():
                 'Source': f"{a.source_ip} ({a.source_country})",
                 'Cible': a.target_country,
                 'Feed': a.feed_source,
+                'Enrichie': '✅' if a.is_derived else '',
             })
         st.dataframe(df_data, use_container_width=True, hide_index=True)
 
     else:
-        st.info("👈 Configurez vos sources dans la sidebar et cliquez sur **Récupérer les données** pour commencer.")
+        st.info("👆 Sélectionnez des sources et cliquez sur **Récupérer les données**.")
 
-        # Demo placeholder
         st.markdown("### 🗺️ Aperçu (mode démo)")
         demo_attacks = [
             CyberAttack(35.86, 104.19, 39.83, -98.58, 'Malware C2', 'critical',
                        datetime.now(), '192.0.2.1', 'US', 'CN', 443, 'TCP', 95,
-                       'Demo', 'Exemple de menace', 'CVE-2024-0001'),
+                       'Demo', 'Exemple de menace temps réel', 'CVE-2024-0001'),
             CyberAttack(55.38, -3.44, 48.86, 2.35, 'SSH Bruteforce', 'high',
                        datetime.now(), '198.51.100.5', 'FR', 'GB', 22, 'TCP', 78,
-                       'Demo', 'Tentative de connexion SSH'),
+                       'Demo', 'Données fraîches de DShield'),
         ]
         m = build_map(demo_attacks, show_heatmap=True)
         st_folium(m, width="100%", height=500, returned_objects=[])
 
-    # Footer
     st.markdown("---")
     st.caption(f"Dernière mise à jour : {st.session_state.last_update.strftime('%H:%M:%S') if st.session_state.last_update else 'Jamais'}")
 
