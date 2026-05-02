@@ -64,7 +64,7 @@ class SecretsManager:
         return {
             'dshield': {
                 'label': 'DShield (SANS ISC)',
-                'description': 'Top 20 sources d'attaques réseau — données temps réel',
+                'description': 'Top 20 sources attaques réseau — données temps réel',
                 'configured': True,
                 'requires_key': False,
                 'icon': '🛡️',
