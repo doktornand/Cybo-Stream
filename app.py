@@ -64,7 +64,7 @@ class SecretsManager:
         return {
             'dshield': {
                 'label': 'DShield (SANS ISC)',
-                'description': 'Top 20 sources attaques réseau — données temps réel',
+                'description': 'Top 20 sources d'attaques réseau — données temps réel',
                 'configured': True,
                 'requires_key': False,
                 'icon': '🛡️',
@@ -153,7 +153,7 @@ class CyberAttack:
                 'high': '#ff8800', 'critical': '#ff0000'}.get(self.severity, '#ffffff')
 
     def _get_popup_html(self) -> str:
-        derived_badge = '<span style="background:#ff6600;color:#fff;padding:2px 6px;border-radius:3px;font-size:.75em;">ENRICHIE</span><br>' if self.is_derived else ''
+        derived_badge = '<span style="background:#ff6600;color:#fff;padding:2px 6px;border-radius:3px;font-size:.75em;">ENRICHIE</span><br>' if getattr(self, 'is_derived', False) else ''
         cve_line = f'<b>CVE:</b> <a href="https://cve.mitre.org/cgi-bin/cvename.cgi?name={self.cve_id}" target="_blank" style="color:#00aaff;">{self.cve_id}</a><br>' if self.cve_id else ''
         return f"""
         <div style="font-family:monospace;background:#1a1a1a;color:#00ff00;padding:10px;
@@ -845,7 +845,7 @@ def render_metrics(attacks: List[CyberAttack]):
     cols = st.columns(5)
     total = len(attacks)
     by_sev = Counter(a.severity for a in attacks)
-    by_derived = sum(1 for a in attacks if a.is_derived)
+    by_derived = sum(1 for a in attacks if getattr(a, 'is_derived', False))
     metrics = [
         ("Total", total, "#ffffff"),
         ("Critical", by_sev.get('critical', 0), "#ff0000"),
@@ -993,7 +993,7 @@ def main():
                 'Source': f"{a.source_ip} ({a.source_country})",
                 'Cible': a.target_country,
                 'Feed': a.feed_source,
-                'Enrichie': '✅' if a.is_derived else '',
+                'Enrichie': '✅' if getattr(a, 'is_derived', False) else '',
             })
         st.dataframe(df_data, use_container_width=True, hide_index=True)
 
